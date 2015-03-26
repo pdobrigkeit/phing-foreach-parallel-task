@@ -20,6 +20,7 @@
 
 namespace MaK\Phing\Task;
 
+use \FileSystem;
 use \BuildException;
 use \FileList;
 use \FileSet;
@@ -79,6 +80,12 @@ class ForeachParallelTask extends Task
     /** Maximum number of threads / processes */
     private $threadCount = 2;
 
+    /**
+     * PhingCallTask that will be invoked w/ calleeTarget.
+     * @var PhingCallTask
+     */
+    private $callee;
+
     /** Array of filesets */
     private $filesets = array();
 
@@ -107,21 +114,20 @@ class ForeachParallelTask extends Task
      * Total number of directories processed
      * @var integer
      */
-    private $total_dirs  = 0;
+    private $total_dirs = 0;
 
-    private function getCallee()
+    public function init()
     {
-        $callee = $this->project->createTask("phingcall");
-        $callee->setOwningTarget($this->getOwningTarget());
-        $callee->setTaskName($this->getTaskName());
-        $callee->setLocation($this->getLocation());
-        $callee->init();
-
-        return $callee;
+        $this->callee = $this->project->createTask("phingcall");
+        $this->callee->setOwningTarget($this->getOwningTarget());
+        $this->callee->setTaskName($this->getTaskName());
+        $this->callee->setLocation($this->getLocation());
+        $this->callee->init();
     }
 
     /**
      * This method does the work.
+     * @throws BuildException
      * @return void
      */
     public function main()
@@ -149,6 +155,10 @@ class ForeachParallelTask extends Task
         $parallelManager = new DocBlox_Parallel_Manager();
         $parallelManager->setProcessLimit($this->threadCount);
 
+        $callee = $this->callee;
+        $callee->setTarget($this->calleeTarget);
+        $callee->setInheritAll(true);
+        $callee->setInheritRefs(true);
         $mapper = null;
 
         if ($this->mapperElement !== null) {
@@ -170,16 +180,15 @@ class ForeachParallelTask extends Task
                     }
                     $value = array_shift($value);
                 }
-                $this->log("Setting param '$this->param' to value '$value'" . ($premapped ? " (mapped from '$premapped')" : ''), Project::MSG_VERBOSE);
-                $callee = $this->getCallee();
-                $callee->setTarget($this->calleeTarget);
-                $callee->setInheritAll(true);
-                $callee->setInheritRefs(true);
-
+                $this->log(
+                    "Setting param '$this->param' to value '$value'" . ($premapped ? " (mapped from '$premapped')" : ''),
+                    Project::MSG_VERBOSE
+                );
                 $prop = $callee->createProperty();
                 $prop->setOverride(true);
                 $prop->setName($this->param);
                 $prop->setValue($value);
+                //$callee->main();
                 $worker = new DocBlox_Parallel_Worker(
                     array($callee, 'main'),
                     array($callee)
@@ -193,24 +202,30 @@ class ForeachParallelTask extends Task
         foreach ($this->filelists as $fl) {
             $srcFiles = $fl->getFiles($this->project);
 
-            $this->process($parallelManager, $this->getCallee(), $fl->getDir($this->project), $srcFiles, array());
+            $this->process($parallelManager, $callee, $fl->getDir($this->project), $srcFiles, array());
         }
 
         // filesets
         foreach ($this->filesets as $fs) {
-            $ds       = $fs->getDirectoryScanner($this->project);
+            $ds = $fs->getDirectoryScanner($this->project);
             $srcFiles = $ds->getIncludedFiles();
-            $srcDirs  = $ds->getIncludedDirectories();
+            $srcDirs = $ds->getIncludedDirectories();
 
-            $this->process($parallelManager, $this->getCallee(), $fs->getDir($this->project), $srcFiles, $srcDirs);
+            $this->process($parallelManager, $callee, $fs->getDir($this->project), $srcFiles, $srcDirs);
         }
 
         $parallelManager->execute();
 
         if ($this->list === null) {
-            $this->log("Processed {$this->total_dirs} directories and {$this->total_files} files", Project::MSG_VERBOSE);
+            $this->log(
+                "Processed {$this->total_dirs} directories and {$this->total_files} files",
+                Project::MSG_VERBOSE
+            );
         } else {
-            $this->log("Processed $total_entries entr" . ($total_entries > 1 ? 'ies' : 'y') . " in list", Project::MSG_VERBOSE);
+            $this->log(
+                "Processed $total_entries entr" . ($total_entries > 1 ? 'ies' : 'y') . " in list",
+                Project::MSG_VERBOSE
+            );
         }
     }
 
@@ -234,45 +249,56 @@ class ForeachParallelTask extends Task
         $this->total_files += $filecount;
 
         for ($j = 0; $j < $filecount; $j++) {
+            $callee = $callee;
+
             $value = $srcFiles[$j];
             $premapped = "";
 
-            if ($this->absparam) {
-                $prop = $callee->createProperty();
-                $prop->setOverride(true);
-                $prop->setName($this->absparam);
-                $prop->setValue($fromDir . FileSystem::getFileSystem()->getSeparator() . $value);
-            }
-
-            if ($mapper !== null) {
-                $premapped = $value;
-                $value = $mapper->main($value);
-                if ($value === null) {
-                    continue;
-                }
-                $value = array_shift($value);
-            }
-
-            if ($this->param) {
-                $this->log("Setting param '$this->param' to value '$value'" . ($premapped ? " (mapped from '$premapped')" : ''), Project::MSG_VERBOSE);
-                $prop = $callee->createProperty();
-                $prop->setOverride(true);
-                $prop->setName($this->param);
-                $prop->setValue($value);
-            }
-
+            $absparam = $this->absparam;
+            $param = $this->param;
             $worker = new DocBlox_Parallel_Worker(
-                array($callee, 'main'),
-                array($callee)
+                function() use ($callee, $value, $param, $absparam, $fromDir, $mapper, $premapped) {
+
+                    if ($absparam) {
+                        $prop = $callee->createProperty();
+                        $prop->setOverride(true);
+                        $prop->setName($absparam);
+                        $prop->setValue($fromDir . FileSystem::getFileSystem()->getSeparator() . $value);
+                    }
+
+                    if ($mapper !== null) {
+                        $premapped = $value;
+                        $value = $mapper->main($value);
+                        if ($value === null) {
+                            return;
+                        }
+                        $value = array_shift($value);
+                    }
+
+                    if ($param) {
+                        $this->log(
+                            "Setting param '$param' to value '$value'" . ($premapped ? " (mapped from '$premapped')" : ''),
+                            Project::MSG_VERBOSE
+                        );
+                        $prop = $callee->createProperty();
+                        $prop->setOverride(true);
+                        $prop->setName($param);
+                        $prop->setValue($value);
+                    }
+
+                    $callee->main();
+                },
+                array()
             );
 
             $parallelManager->addWorker($worker);
+            //$callee->main();
         }
 
         $dircount = count($srcDirs);
         $this->total_dirs += $dircount;
 
-        for ($j = 0; $j <  $dircount; $j++) {
+        for ($j = 0; $j < $dircount; $j++) {
             $value = $srcDirs[$j];
             $premapped = "";
 
@@ -293,7 +319,10 @@ class ForeachParallelTask extends Task
             }
 
             if ($this->param) {
-                $this->log("Setting param '$this->param' to value '$value'" . ($premapped ? " (mapped from '$premapped')" : ''), Project::MSG_VERBOSE);
+                $this->log(
+                    "Setting param '$this->param' to value '$value'" . ($premapped ? " (mapped from '$premapped')" : ''),
+                    Project::MSG_VERBOSE
+                );
                 $prop = $callee->createProperty();
                 $prop->setOverride(true);
                 $prop->setName($this->param);
@@ -301,34 +330,50 @@ class ForeachParallelTask extends Task
             }
 
             $worker = new DocBlox_Parallel_Worker(
-                array($callee, 'main'),
-                array($callee)
+                array(clone $callee, 'main'),
+                array()
             );
 
             $parallelManager->addWorker($worker);
+            //$callee->main();
         }
     }
 
+    /**
+     * @param $list
+     */
     public function setList($list)
     {
         $this->list = (string) $list;
     }
 
+    /**
+     * @param $target
+     */
     public function setTarget($target)
     {
         $this->calleeTarget = (string) $target;
     }
 
+    /**
+     * @param $param
+     */
     public function setParam($param)
     {
         $this->param = (string) $param;
     }
 
+    /**
+     * @param $absparam
+     */
     public function setAbsparam($absparam)
     {
         $this->absparam = (string) $absparam;
     }
 
+    /**
+     * @param $delimiter
+     */
     public function setDelimiter($delimiter)
     {
         $this->delimiter = (string) $delimiter;
@@ -346,6 +391,7 @@ class ForeachParallelTask extends Task
     /**
      * Nested adder, adds a set of files (nested fileset attribute).
      *
+     * @param FileSet $fs
      * @return void
      */
     public function addFileSet(FileSet $fs)
@@ -356,7 +402,6 @@ class ForeachParallelTask extends Task
     /**
      * Nested creator, creates one Mapper for this task
      *
-     * @access  public
      * @return object         The created Mapper type object
      * @throws BuildException
      */
@@ -386,6 +431,6 @@ class ForeachParallelTask extends Task
     {
         $num = array_push($this->filelists, new FileList());
 
-        return $this->filelists[$num-1];
+        return $this->filelists[$num - 1];
     }
 }
